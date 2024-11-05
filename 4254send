@@ -1,0 +1,343 @@
+#!/usr/bin/python3 -u
+#
+
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+from base64 import b64encode, b64decode
+
+
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " 4254send: " + string + "\n")
+
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = .5
+SEQUENCE = 0
+RTO = 1
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":") + 1:])
+dest = (UDP_IP, UDP_PORT)
+
+time.sleep(0.5)
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(TIMEOUT)
+BUFFER_SIZE = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+
+# -------------------------------------------------------------------#
+# [Variable Definations]                                             #
+# -------------------------------------------------------------------#
+cwnd = 1
+ssthresh = 38
+last_ack = 0
+reset_ack_count = 0
+seqnum = 0
+acked = 0
+
+slowStart = True
+addIncrease = False
+shutDown = False
+timerRTO = None
+
+data_buffer = sys.stdin.buffer.read()
+log(str(len(data_buffer)))
+data_buffer_size = len(data_buffer)
+leftover = len(data_buffer) % 1000
+window = {}  # Holds packet sequence numbers and time of sending
+
+
+# -------------------------------------------------------------------#
+# [Support Functions]                                                #
+# -------------------------------------------------------------------#
+
+def calculate_checksum(data):
+    checksum = 0
+    for i in range(0, len(data), 2):
+        w = (data[i] << 8) + (data[i + 1] if i + 1 < len(data) else 0)
+        checksum = (checksum + w) & 0xffff
+    return checksum
+
+def send_packet(sequence, eof=False, ack=False, syn=False):
+    """
+      Sends packets based on the sequence number provided.
+    """
+    if syn == True and ack == True:
+        log("[Data] Buffer Size: " + str(BUFFER_SIZE))
+        data_to_send = bytes(str(BUFFER_SIZE), 'utf-8')
+    elif syn == True:
+        data_to_send = bytes('HI', 'utf-8')
+    elif ack == True:
+        data_to_send = bytes('OK', 'utf-8')
+    else:
+        data_to_send = data_buffer[sequence:sequence + DATA_SIZE]
+
+    if data_buffer_size - sequence == leftover and (not ack or not syn):
+        eof = True
+
+    checksum = calculate_checksum(data_to_send)
+    msg = json.dumps({"sequence": sequence, "data": b64encode(data_to_send).decode(), "ack": ack, "eof": eof, "syn": syn, "checksum": checksum})
+    # log("[SEND] ABOUT TO SEND " + msg)
+
+    if sock.sendto(msg.encode(), dest) < len(msg):
+        log("[error] unable to fully send packet")
+    elif syn or (ack and syn):
+        log("[send data] " + str(sequence) + " (" + str((data_to_send)) + ")")
+    elif eof:
+        log("[send data] " + str(sequence) + " (" + str(len(data_to_send)) + ")" + "EOF: " + str(eof))
+    else:
+        log("[send data] " + str(sequence) + " (" + str(len(data_to_send)) + ")")
+        window[sequence] = [time.time(), False]
+
+
+def intial_handshake():
+    wait = True
+    syn_recived = False
+    ack_syn_sent = False
+    send_packet(0, syn=True)
+    syn_sent = True
+    while wait:
+        try:
+            result = sock.recvfrom(MSG_SIZE)
+            if result:
+                (data, addr) = result
+                try:
+                    decoded = json.loads(data.decode())
+                    data_recieved = (b64decode(decoded['data'].encode()))
+                    log("[recv pkt] " + str(data_recieved))
+                    if (decoded['syn'] == True or syn_recived == True) and decoded['ack'] == False:
+                        # syn_recived= True
+                        log("[Send pkt] ack-syn")
+                        send_packet(0, ack=True, syn=True)  # We will now send the window size with this packet and receive a ack back with the window size
+                        ack_syn_sent = True
+                    elif (decoded['ack'] == True):
+                        recv_buffer_size = int(data_recieved)
+                        log("you are here")
+                        return True
+                    # elif (data_recieved != bytes(str(BUFFER_SIZE),'utf-8')): # Try Handshake Again
+                    # return False
+
+
+                except (ValueError, KeyError, TypeError) as e:
+                    raise e
+            else:
+                if ack_syn_sent:
+                    send_packet(0, ack=True, syn=True)
+                elif syn_sent and not ack_syn_sent:
+                    send_packet(0, syn=True)
+        except socket.timeout:
+            if ack_syn_sent:
+                send_packet(0, ack=True, syn=True)
+            elif syn_sent and not ack_syn_sent:
+                send_packet(0, syn=True)
+
+
+def handle_shutdown(seq, start):
+    while time.time() - start < 1:
+        time.sleep(.20)
+        send_packet(seq, eof=True, ack=False, syn=False)
+    exit(0)
+
+
+def handle_window(seq):
+    global window, shutDown, timerRTO, acked, last_ack, cwnd, ssthresh, slowStart, addIncrease, reset_ack_count, data_buffer_size, leftover
+    if last_ack == (data_buffer_size - leftover - DATA_SIZE) or shutDown:
+        shutDown = True
+        handle_shutdown(last_ack + DATA_SIZE, time.time())
+
+    if timerRTO:
+        if time.time() - timerRTO - RTO <= 0:
+            ssthresh = cwnd // 2
+            cwnd = 1
+            slowStart = True
+            addIncrease = False
+
+    windowseal = min(window, key=window.get)
+    if seq < windowseal:
+        reset_ack_count += 1
+        if reset_ack_count == 3:
+            send_packet(last_ack + DATA_SIZE)
+            ssthresh = cwnd // 2
+            cwnd = 1
+            slowStart = True
+            addIncrease = False
+            reset_ack_count = 0
+    elif (windowseal == seq):
+        last_ack = seq
+        if timerRTO:
+            timerRTO = time.time()
+        acked += 1
+    elif last_ack == seq:
+        reset_ack_count += 1
+        if reset_ack_count == 3:
+            send_packet(last_ack + DATA_SIZE)
+            ssthresh = cwnd // 2
+            cwnd = 1
+            slowStart = True
+            addIncrease = False
+            reset_ack_count = 0
+        if timerRTO:
+            timerRTO = time.time()
+        last_ack = seq
+    elif seq > last_ack:
+        last_ack = seq
+        for i in range(windowseal, seq, DATA_SIZE):
+            # log["[SEND] Window to delete: " + str(i*DATA_SIZE)]
+            try:
+                # log("Deleting Window Packet: " + str(i))
+                del window[i]
+                acked += 1
+            except:
+                pass
+        windowseal = seq
+        reset_ack_count = 0
+        if timerRTO:
+            timerRTO = time.time()
+    elif seq in window:
+        del window[seq]
+        acked += 1
+        if timerRTO:
+            timerRTO = time.time()
+    if addIncrease and acked >= cwnd:
+        cwnd += 1
+
+    window_length = len(window)
+    # log("[SEND] Window Length: " + str(window_length))
+    # log("[SEND] Windowseal 2: " + str(windowseal))
+    left_over = cwnd - window_length
+    # print(window)
+
+    # TODO -> Add testing to see if the seq is in the the window and then deleting that window and continuing on.
+
+    while ((len(window) <= cwnd) and shutDown == False):
+        if (windowseal + ((cwnd - left_over) * DATA_SIZE)) >= data_buffer_size:
+            #  log("Loop Broken:[windowseal + cwnd - leftover * datasize] : " + str(windowseal + ((cwnd - left_over) * DATA_SIZE)))
+            break
+        # else:
+        # log("Packet Number: " + str(windowseal + ((cwnd - left_over) * DATA_SIZE)))
+        send_packet(windowseal + ((cwnd - left_over) * DATA_SIZE))  # Sends next packet in window
+        left_over -= 1
+
+        print(last_ack)
+
+
+def slow_start():
+    global cwnd, ssthresh, timerRTO, window, sock, shutDown, last_ack, slowStart, addIncrease, addr
+    timerRTO = None
+    while cwnd < ssthresh and slowStart == True:
+        try:
+            result = sock.recvfrom(MSG_SIZE)
+            if result:
+                # Check Window for ACK
+                (data, addr) = result
+                decoded = json.loads(data.decode())
+                seqnum = decoded['sequence']
+                log("[Send] recv pkt in slow_start: " + str(decoded))
+                log("[Send] recv ack in slow_start: " + str(decoded['ack']))
+                if decoded['eof'] == True:
+                    sys.exit(0)
+                if last_ack == (data_buffer_size - leftover - DATA_SIZE) or shutDown:
+                    shutDown = True
+                    handle_shutdown(last_ack + DATA_SIZE, time.time())
+                cwnd = 2 * cwnd
+                handle_window(seqnum)
+            else:
+                # log("You are here")
+                handle_window(last_ack)
+        except socket.timeout:
+            if shutDown:
+                handle_window(last_ack + DATA_SIZE, time.time())
+            else:
+                for seq in window:
+                    if time.time() > window[seq][0] - .1:
+                        slowStart = False
+                        addIncrease = True
+                        timerRTO = time.time()
+                        send_packet(seq)
+    else:
+        slowStart = False
+        addIncrease = True
+
+
+def add_increase():
+    global cwnd, ssthresh, timerRTO, window, sock, shutDown, last_ack, slowStart, addIncrease, acked, addr
+    while addIncrease and cwnd >= ssthresh:
+        try:
+            result = sock.recvfrom(MSG_SIZE)
+            if result:
+
+                # Check Window for ACK
+                (data, addr) = result
+                decoded = json.loads(data.decode())
+                seqnum = decoded['sequence']
+                log("[Send] recv pkt in add_increase: " + str(decoded))
+                log("[Send] recv ack in add_increase: " + str(decoded['ack']))
+
+                if decoded['eof'] == True:
+                    sys.exit(0)
+                if last_ack == (data_buffer_size - leftover - DATA_SIZE) or shutDown:
+                    shutDown = True
+                    handle_shutdown(last_ack + DATA_SIZE, time.time())
+
+                if acked >= cwnd:
+                    cwnd += 1
+                    acked = 0
+
+                handle_window(seqnum)
+
+        except socket.timeout:
+            if shutDown:
+                handle_window(last_ack + DATA_SIZE, time.time())
+            else:
+                for seq in window:
+                    if time.time() > window[seq][0] - .1:
+                        timerRTO = time.time()
+                        send_packet(seq)
+            """ else:
+            #Checks for timeouts in the window and retransmits packet that have timedout
+              for seq in window:
+                if time.time() > window[seq][0] - .10:
+                  slowStart = False
+                  addIncrease = True
+                  send_packet(seq) """
+    else:
+        slowStart = True
+        addIncrease = False
+
+
+# -------------------------------------------------------------------#
+# [Main Loop]                                                        #
+# -------------------------------------------------------------------#
+
+while not intial_handshake():
+    log("Waiting for Handshake to complete...")
+
+# log("Handshake complete starting sending...")
+# Sends intial Window of Packets
+for i in range(0, cwnd):
+    send_packet((i * DATA_SIZE) + SEQUENCE)
+
+while True:
+    if timerRTO:
+        if timerRTO - time.time() < RTO:
+            ssthresh = cwnd // 2
+            cwnd = 1
+            slowStart = True
+            addIncrease = False
+
+    if slowStart:
+        slow_start()
+    elif addIncrease:
+        add_increase()
+    else:
+        log("[Send] You Should not be here...")

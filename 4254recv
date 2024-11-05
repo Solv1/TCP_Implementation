@@ -1,0 +1,220 @@
+#!/usr/bin/python3 -u
+#
+
+
+from pickle import GLOBAL
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+from base64 import b64decode, b64encode
+
+# f = open("crptcat.mp4", 'wb')
+# f = open("crptdata.txt", 'a')
+
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+
+MSG_SIZE = 1500
+TIMEOUT = .5
+DATA_SIZE = 1000
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+BUFFER_SIZE = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+
+expected_sequence = 0
+last_ack = None
+window_size = None
+buffer_tracker = 0
+
+def calculate_checksum(data):
+    checksum = 0
+    for i in range(0, len(data), 2):
+        w = (data[i] << 8) + (data[i + 1] if i + 1 < len(data) else 0)
+        checksum = (checksum + w) & 0xffff
+    return checksum
+
+def verify_checksum(data, recv_chksm):
+    calc_checksum = calculate_checksum(data)
+    log("recv_checksum: " + str(recv_chksm))
+    log("calc_checksum: " + str(calc_checksum))
+    if calc_checksum == recv_chksm: return True
+    else: return False
+
+def send_packet(sequence, data_to_send, eof=False, ack=False, syn=False):
+    """
+      Sends packets based on the sequence number provided.
+    """
+    global addr
+    if syn == True:
+        data_to_send = bytes('HI', 'utf-8')
+    elif ack == True and syn == True:
+        data_to_send = bytes('OK', 'utf-8')
+
+    msg = json.dumps({"sequence": sequence, "data": b64encode(data_to_send).decode(), "ack": ack, "eof": eof, "syn": syn})
+    log("[RECV] ABOUT TO SEND " + msg)
+    if sock.sendto(msg.encode(), addr) < len(msg):
+        log("[error] unable to fully send packet")
+
+
+def intial_handshake():
+    global expected_sequence, addr, buffer_size
+    syn_sent = False
+    ack_syn_sent = False
+    data_received = None
+    while True:
+        try:
+            packet = sock.recvfrom(MSG_SIZE)
+            if packet:
+                (data, addr) = packet
+                try:
+                    decoded = json.loads(data.decode())
+                    ack = bool(decoded['ack'])
+                    syn = bool(decoded['syn'])
+                    log('[Decoded ACK:]' + str(ack))
+                    log('[Decoded SYN:]' + str(syn))
+                    data_received = (b64decode(decoded['data'].encode()))
+                    if not verify_checksum(data_received, decoded['checksum']):
+                        continue
+
+                    if (syn == True and ack == False):
+                        send_packet(0, b'0', syn=syn)
+                        syn_sent = True
+
+                    elif (syn == True and ack == True):
+                        # log(str(data_received))
+                        send_packet(0, bytes(str(BUFFER_SIZE), 'utf-8'), ack=ack)
+                        ack_syn_sent = True
+                        expected_sequence = decoded['sequence']
+                        buffer_size = b64decode(decoded['data'].encode())
+                        log("[RECV] Buffer: " + str(buffer_size))
+                        log("[RECV] Expected Sequence: " + str(expected_sequence))
+
+                        log("Handshake Complete on Receiver Side")
+                        return True
+
+                    elif data_received == b'OK' and ack == True:
+
+                        log("Handshake Complete on Receiver Side")
+                        return True
+
+                except (ValueError, KeyError, TypeError) as e:
+                    # log('Nothing received waiting...')
+                    raise e
+
+            else:
+                if ack_syn_sent:
+                    send_packet(0, data_received, ack=ack, syn=syn)
+                elif syn_sent and not ack_syn_sent:
+                    send_packet(0, b'0', syn=syn)
+                else:
+                    return False
+        except socket.timeout:
+            if ack_syn_sent:
+                send_packet(0, data_received, ack=ack, syn=syn)
+            elif syn_sent and not ack_syn_sent:
+                send_packet(0, b'0', syn=syn)
+
+
+def handle_shutdown(start):
+    while time.time() - start < 1:
+        time.sleep(.10)
+        send_packet(0, data_to_send=b'BYE', eof=True)
+    exit(0)
+
+
+while not intial_handshake():
+    log("Waiting for Handshake to complete....")
+
+# Now listen for packets
+while True:
+    try:
+        result = sock.recvfrom(MSG_SIZE)
+
+        # If nothing is ready, we hit the timeout
+        if result:
+            (data, addr) = result  # note, data is bytes, so we must convert back to string before use
+
+            try:
+                decoded = json.loads(data.decode())
+
+                seq = decoded['sequence']
+                # If the EOF flag is set, exit
+                if (decoded['eof']) and seq == expected_sequence:
+                    # seq = decoded['sequence']
+                    data = b64decode(decoded['data'].encode())
+                    if not verify_checksum(data, decoded['checksum']):
+                        continue
+                    # log("[recv data] " + str(seq) + " (" + str(len(data)) + ") ACCEPTED (in-order) with eof")
+                    sys.stdout.buffer.write(data)
+                    # f.write(data)
+                    # f.write(str(data))
+                    # f.close()
+                    # log("[completed on reciver side]")
+                    handle_shutdown(time.time())
+                    sys.exit(0)
+
+                # If there is data, we accept it and print it out
+                elif (decoded['data']):
+                    data = b64decode(decoded['data'].encode())
+                    if not verify_checksum(data, decoded['checksum']):
+                        continue
+                    seq = decoded['sequence']
+                    if data == buffer_size:
+                        send_packet(0, bytes(str(BUFFER_SIZE), 'utf-8'), ack=True)
+
+                    elif seq == expected_sequence:
+                        buffer_tracker = buffer_tracker // 2
+                        last_ack = seq
+                        log("[recv data] " + str(seq) + " (" + str(len(data)) + ") ACCEPTED (in-order)")
+                        send_packet(seq, b'0', ack=True)
+
+                        expected_sequence += len(data)
+
+                        sys.stdout.buffer.write(data)
+                        # f.write(data)
+                        # f.write(str(data))
+                    elif data == b'5':
+                        send_packet(0, data, ack=True)
+
+                    else:
+                        log("[recv data] " + str(seq) + " (" + str(len(data)) + ") DROPPED (out-of-order)" + "EOF: " + str(decoded['eof']))
+                        buffer_tracker += DATA_SIZE
+                        if last_ack == None:
+                            continue
+                        elif buffer_tracker < int(buffer_size):
+                            # log("SENDING LAST ACK RECEIVED: " + str(last_ack))
+                            send_packet(last_ack, b'0', ack=True)
+                        else:
+                            log("[RECV] Waiting for valid ack to lower buffer")
+
+                # Send back an ack to the sender
+
+
+            except (ValueError, KeyError, TypeError) as e:
+                # log("[recv corrupt packet]")
+                raise e
+    except socket.timeout:
+        if last_ack == None:
+            continue
+        else:
+            send_packet(last_ack, b'0', ack=True)
+    # else:
+    #  log("[error] timeout")
+    #  sys.exit(-1)
